@@ -1,0 +1,42 @@
+[project]
+name = "drive-telegram-manager"
+version = "0.1.0"
+description = "بوت Telegram عربي لإدارة Google Drive Mount في Google Colab"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "aiogram==3.20.0.post0",
+  "pydantic-settings==2.9.1",
+  "python-dotenv==1.1.0",
+]
+
+[project.optional-dependencies]
+colab = ["google-api-python-client==2.169.0", "google-auth==2.40.3"]
+
+development = ["aiohttp==3.11.18", "pytest==8.4.1", "pytest-asyncio==1.0.0", "ruff==0.12.0"]
+
+[project.scripts]
+drive-telegram-manager = "drive_telegram_manager.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drive_telegram_manager"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".build", ".local", ".tmp", "state"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/drive_telegram_manager/telegram/bot.py" = ["E501"]

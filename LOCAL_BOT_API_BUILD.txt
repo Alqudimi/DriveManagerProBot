@@ -1,0 +1,12 @@
+Telegram Bot API local server bundled with this project
+
+Source repository: https://github.com/tdlib/telegram-bot-api.git
+Source commit: e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1
+Built locally from source with CMake in Ubuntu 24.04.5 x86_64
+Artifact path: .local/bin/telegram-bot-api
+Artifact size: 46,306,288 bytes
+Required GLIBC symbol baseline: GLIBC_2.38
+SHA-256: a2e1f71e0cf308412e88cf9cafa133371e1a40a3139f0bfd3f93d8647d7d8113
+Validation: executable --help succeeded in the build environment
+
+Colab's release notes announced Ubuntu 24.04 runtimes on 2026-09-16. This binary has not been run inside a real Colab session; older Ubuntu 22.04 Colab runtimes do not meet its GLIBC baseline.
