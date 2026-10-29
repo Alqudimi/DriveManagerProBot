@@ -25,6 +25,7 @@ from drive_telegram_manager.telegram.bot import (
     _split_pair,
     _transfer_cancel_keyboard,
     _upload_keyboard,
+    _upload_queue_text,
     build_bot,
     make_dispatcher,
 )
@@ -64,6 +65,19 @@ def test_upload_progress_format_is_readable():
 def test_transfer_progress_keyboard_has_cancel_callback():
     markup = _transfer_cancel_keyboard("dlcancel:1234", "التنزيل")
     assert markup.inline_keyboard[0][0].callback_data == "dlcancel:1234"
+
+
+def test_upload_queue_lists_file_states():
+    text = _upload_queue_text(
+        {
+            "files": [
+                {"name": "video.mp4", "status": "queued"},
+                {"name": "done.pdf", "status": "completed"},
+            ]
+        }
+    )
+    assert "video.mp4 — ⏳ منتظر" in text
+    assert "done.pdf — ✅ اكتمل" in text
 
 
 def test_relative_drive_paths_stay_inside_allowed_root(tmp_path: Path):

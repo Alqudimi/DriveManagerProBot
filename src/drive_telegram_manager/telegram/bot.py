@@ -62,6 +62,7 @@ def _upload_keyboard(stage: str) -> InlineKeyboardMarkup:
     if stage == "collecting":
         rows = [
             [InlineKeyboardButton(text="✅ انتهيت من إرسال الملفات", callback_data="up:done")],
+            [InlineKeyboardButton(text="📋 عرض قائمة الانتظار", callback_data="up:queue")],
             [InlineKeyboardButton(text="📂 تغيير مجلد الحفظ", callback_data="up:folder")],
             [InlineKeyboardButton(text="❌ إلغاء جلسة الرفع", callback_data="up:cancel")],
         ]
@@ -73,6 +74,7 @@ def _upload_keyboard(stage: str) -> InlineKeyboardMarkup:
     elif stage == "confirm":
         rows = [
             [InlineKeyboardButton(text="🚀 تأكيد ورفع إلى Drive", callback_data="up:confirm")],
+            [InlineKeyboardButton(text="📋 عرض قائمة الانتظار", callback_data="up:queue")],
             [InlineKeyboardButton(text="➕ إضافة ملفات أخرى", callback_data="up:more")],
             [InlineKeyboardButton(text="❌ إلغاء جلسة الرفع", callback_data="up:cancel")],
         ]
@@ -107,6 +109,18 @@ def _progress_bar(completed: int, total: int) -> str:
     ratio = min(1.0, completed / total) if total else 1.0
     filled = int(ratio * 10)
     return f"{'█' * filled}{'░' * (10 - filled)} {ratio:.0%}"
+
+
+def _upload_queue_text(session: dict) -> str:
+    files = session.get("files", [])
+    if not files:
+        return "قائمة الانتظار فارغة. أرسل ملفًا أو فيديو لإضافته."
+    labels = {"queued": "⏳ منتظر", "uploading": "📤 جارٍ الرفع", "completed": "✅ اكتمل", "failed": "❌ فشل"}
+    lines = [
+        f"{index}. {item['name'][:90]} — {labels.get(item.get('status', 'queued'), '⏳ منتظر')}"
+        for index, item in enumerate(files, start=1)
+    ]
+    return f"قائمة انتظار الرفع ({len(files)} ملفًا):\n" + "\n".join(lines)
 
 
 def _transfer_cancel_keyboard(callback_data: str, label: str) -> InlineKeyboardMarkup:
@@ -539,6 +553,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 raise NotADirectoryError("مجلد الوجهة لم يعد متاحًا في Drive")
             async with jobs.semaphore:
                 for item in session["files"]:
+                    item["status"] = "uploading"
                     source = Path(item["path"])
                     target = unique_destination(root / safe_name(item["name"]))
                     copied_to_drive = False
@@ -556,6 +571,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                                 note=session["note"],
                             )
                             copied_to_drive = True
+                            item["status"] = "completed"
                             results.append(f"✅ {target.name}")
                         except OSError:
                             results.append(f"✅ {target.name} — حُفظ لكن فشل تحديث CSV")
@@ -565,6 +581,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                         except OSError:
                             log.warning("Could not remove staged upload %s", source.name)
                     except Exception as exc:
+                        item["status"] = "failed"
                         if not copied_to_drive:
                             target.unlink(missing_ok=True)
                         failures.append(f"❌ {item['name']}: {type(exc).__name__}")
@@ -601,7 +618,11 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 await query.message.edit_text("⏳ جارٍ إلغاء الرفع... سيتم تنظيف الملف المؤقت.")
                 await query.answer("تم طلب إلغاء الرفع")
                 return
-            if action == "menu":
+            if action == "queue":
+                if not session:
+                    raise ValueError("لا توجد جلسة رفع نشطة")
+                await query.message.answer(_upload_queue_text(session), reply_markup=_upload_keyboard(session["stage"]))
+            elif action == "menu":
                 await query.message.answer("القائمة الرئيسية:", reply_markup=MENU)
             elif action == "folder":
                 if not session or session["stage"] != "collecting":
@@ -1254,6 +1275,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                         "path": str(local_temp),
                         "name": name,
                         "size": size,
+                        "status": "queued",
                     }
                 )
                 local_temp = None  # ownership transferred to the per-user session
