@@ -89,6 +89,21 @@ def _media_details(media: Document | Video | Audio | PhotoSize) -> tuple[str, st
     return media.file_id, media.file_unique_id, getattr(media, "file_size", None), name
 
 
+def _format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024 or unit == "TB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TB"
+
+
+def _progress_bar(completed: int, total: int) -> str:
+    ratio = min(1.0, completed / total) if total else 1.0
+    filled = int(ratio * 10)
+    return f"{'█' * filled}{'░' * (10 - filled)} {ratio:.0%}"
+
+
 class ProgressInputFile(FSInputFile):
     """Read a local file in chunks and report bytes passed to the HTTP request stream."""
 
@@ -1143,18 +1158,56 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             return
         local_temp: Path | None = None
         target: Path | None = None
+        progress_message: Message | None = None
         try:
+            progress_message = await message.answer(
+                f"⏳ بدء استقبال {name}\n{_progress_bar(0, expected_size or 0)}\n"
+                f"0 B / {_format_bytes(expected_size or 0)}"
+            )
+            started = time.monotonic()
+            last_update = [started]
+            loop = asyncio.get_running_loop()
+
+            async def update_upload_progress(completed: int, *, force: bool = False) -> None:
+                if progress_message is None:
+                    return
+                current = time.monotonic()
+                if not force and current - last_update[0] < settings.progress_update_interval:
+                    return
+                last_update[0] = current
+                total = expected_size or completed
+                elapsed = max(current - started, 0.001)
+                speed = completed / elapsed
+                remaining = max(0, total - completed) / speed if speed else 0
+                try:
+                    await progress_message.edit_text(
+                        f"📤 رفع {name}\n{_progress_bar(completed, total)}\n"
+                        f"{_format_bytes(completed)} / {_format_bytes(total)}\n"
+                        f"السرعة: {_format_bytes(int(speed))}/ث — المتبقي التقريبي: {int(remaining)}ث\n"
+                        "الحالة: استقبال الملف وتجهيزه للحفظ في Drive"
+                    )
+                except Exception:
+                    log.debug("Unable to update upload progress", exc_info=True)
+
+            def schedule_upload_progress(completed: int) -> None:
+                loop.call_soon_threadsafe(asyncio.create_task, update_upload_progress(completed))
+
             remote = await bot.get_file(file_id)
             local = Path(remote.file_path)
             if session:
                 local_temp = settings.temp_dir / f"dtm-batch-{uuid4().hex}-{name}"
                 if local.is_absolute():
-                    size = await asyncio.to_thread(fs.copy_streaming, local, local_temp)
+                    size = await asyncio.to_thread(
+                        fs.copy_streaming, local, local_temp, on_progress=schedule_upload_progress
+                    )
                 else:
                     await bot.download_file(remote.file_path, destination=local_temp)
                     size = local_temp.stat().st_size
                 if expected_size is not None and size != expected_size:
                     raise OSError("حجم الملف المستلم لا يطابق القيمة المتوقعة")
+                await update_upload_progress(size, force=True)
+                if progress_message is not None:
+                    await progress_message.edit_text(f"✅ اكتمل استقبال {name} ({size:,} بايت) وتجهيزه للرفع.")
                 session["files"].append(
                     {
                         "path": str(local_temp),
@@ -1174,10 +1227,11 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 await bot.download_file(remote.file_path, destination=local_temp)
                 local = local_temp
             target = unique_destination(root_path() / name)
-            size = await asyncio.to_thread(fs.copy_streaming, local, target)
+            size = await asyncio.to_thread(fs.copy_streaming, local, target, on_progress=schedule_upload_progress)
             if expected_size is not None and size != expected_size:
                 target.unlink(missing_ok=True)
                 raise OSError(f"عدم تطابق الحجم المتوقع ({expected_size}) مع المحفوظ ({size})")
+            await update_upload_progress(size, force=True)
             caption = message.caption or ""
             description, note = caption, ""
             for line in caption.splitlines():
@@ -1196,9 +1250,16 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             except OSError:
                 await message.answer(f"تم حفظ {target.name} في Drive، لكن فشل تحديث CSV.")
                 return
+            if progress_message is not None:
+                await progress_message.edit_text(f"✅ اكتمل حفظ {target.name} في Drive ({size:,} بايت).")
             await message.answer(f"تم حفظ {target.name} في Drive ({size:,} بايت) وتحديث CSV.")
         except Exception as exc:
             log.exception("Media transfer failed")
+            if progress_message is not None:
+                try:
+                    await progress_message.edit_text(f"❌ توقف رفع {name}: {type(exc).__name__}")
+                except Exception:
+                    log.debug("Unable to finalize failed upload progress", exc_info=True)
             await message.answer(
                 f"فشل استقبال أو حفظ الملف: {type(exc).__name__}. تحقق من الخادم المحلي ومساحة Drive ثم أعد المحاولة."
             )

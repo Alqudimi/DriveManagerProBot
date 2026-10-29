@@ -44,6 +44,18 @@ def test_split_join_and_checksum(tmp_path: Path):
     assert out.read_bytes() == source.read_bytes()
 
 
+def test_streaming_copy_reports_progress(tmp_path: Path):
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"x" * 10)
+    progress: list[int] = []
+    fs = DriveFilesystem([tmp_path])
+
+    assert fs.copy_streaming(source, destination, chunk_size=3, on_progress=progress.append) == 10
+    assert progress[-1] == 10
+    assert progress == sorted(progress)
+
+
 def test_bad_part_fails_integrity(tmp_path: Path):
     src = tmp_path / "a"
     src.write_bytes(b"abcdef")

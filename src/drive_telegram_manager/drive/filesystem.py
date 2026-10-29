@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 
@@ -84,13 +84,21 @@ class DriveFilesystem:
             raise NotADirectoryError(dst_dir)
         return shutil.move(str(src), str(unique_destination(dst_dir / src.name)))
 
-    def copy_streaming(self, source: Path, destination: Path, chunk_size: int = 8 * 1024 * 1024) -> int:
+    def copy_streaming(
+        self,
+        source: Path,
+        destination: Path,
+        chunk_size: int = 8 * 1024 * 1024,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> int:
         destination = unique_destination(destination)
         count = 0
         with source.open("rb") as src, destination.open("xb") as dst:
             while chunk := src.read(chunk_size):
                 dst.write(chunk)
                 count += len(chunk)
+                if on_progress:
+                    on_progress(count)
             dst.flush()
             os.fsync(dst.fileno())
         return count

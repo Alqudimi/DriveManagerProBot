@@ -18,7 +18,9 @@ from drive_telegram_manager.telegram.bot import (
     ProgressInputFile,
     _create_directory_zip,
     _find_index_rows,
+    _format_bytes,
     _media_details,
+    _progress_bar,
     _resolve_user_path,
     _split_pair,
     _upload_keyboard,
@@ -51,6 +53,11 @@ def test_upload_keyboard_exposes_next_action_for_each_stage():
     assert _upload_keyboard("collecting").inline_keyboard[0][0].callback_data == "up:done"
     assert _upload_keyboard("description").inline_keyboard[0][0].callback_data == "up:skip"
     assert _upload_keyboard("confirm").inline_keyboard[0][0].callback_data == "up:confirm"
+
+
+def test_upload_progress_format_is_readable():
+    assert _format_bytes(1024 * 1024) == "1.0 MB"
+    assert _progress_bar(50, 100) == "█████░░░░░ 50%"
 
 
 def test_relative_drive_paths_stay_inside_allowed_root(tmp_path: Path):
