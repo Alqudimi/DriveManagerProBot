@@ -16,14 +16,18 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    Audio,
     BotCommand,
     CallbackQuery,
+    Document,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    PhotoSize,
     ReplyKeyboardMarkup,
+    Video,
 )
 
 from drive_telegram_manager.config import Settings
@@ -47,6 +51,42 @@ _PENDING_DELETE: dict[str, tuple[int, Path]] = {}
 _UPLOAD_SESSIONS: dict[int, dict] = {}
 _DOWNLOAD_SESSIONS: dict[int, dict] = {}
 _BROWSE_TOKENS: dict[str, tuple[int, str, Path, int]] = {}
+
+
+def _upload_keyboard(stage: str) -> InlineKeyboardMarkup:
+    if stage == "collecting":
+        rows = [
+            [InlineKeyboardButton(text="✅ انتهيت من إرسال الملفات", callback_data="up:done")],
+            [InlineKeyboardButton(text="📂 تغيير مجلد الحفظ", callback_data="up:folder")],
+            [InlineKeyboardButton(text="❌ إلغاء جلسة الرفع", callback_data="up:cancel")],
+        ]
+    elif stage in {"description", "note"}:
+        rows = [
+            [InlineKeyboardButton(text="⏭️ تخطي هذه الخطوة", callback_data="up:skip")],
+            [InlineKeyboardButton(text="❌ إلغاء جلسة الرفع", callback_data="up:cancel")],
+        ]
+    elif stage == "confirm":
+        rows = [
+            [InlineKeyboardButton(text="🚀 تأكيد ورفع إلى Drive", callback_data="up:confirm")],
+            [InlineKeyboardButton(text="➕ إضافة ملفات أخرى", callback_data="up:more")],
+            [InlineKeyboardButton(text="❌ إلغاء جلسة الرفع", callback_data="up:cancel")],
+        ]
+    else:
+        rows = [[InlineKeyboardButton(text="📋 القائمة الرئيسية", callback_data="up:menu")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _media_details(media: Document | Video | Audio | PhotoSize) -> tuple[str, str, int | None, str]:
+    if isinstance(media, Video):
+        default_name = f"video-{uuid4().hex[:8]}.mp4"
+    elif isinstance(media, Audio):
+        default_name = f"audio-{uuid4().hex[:8]}.mp3"
+    elif isinstance(media, PhotoSize):
+        default_name = f"photo-{uuid4().hex[:8]}.jpg"
+    else:
+        default_name = f"upload-{uuid4().hex[:8]}.bin"
+    name = safe_name(getattr(media, "file_name", None) or default_name)
+    return media.file_id, media.file_unique_id, getattr(media, "file_size", None), name
 
 
 class ProgressInputFile(FSInputFile):
@@ -189,7 +229,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
         await message.answer(
             "الأوامر (المسارات النسبية تبدأ من DRIVE_ROOT):\n"
             "/browse [مجلد] — استعراض 15 عنصرًا في الصفحة بأزرار التنقل.\n"
-            "/upload ثم اختيار مجلد من المتصفح، ثم /upload_done — جمع ملفات ووصف وملاحظة وتأكيد.\n"
+            "/upload ثم اختيار المجلد وإرسال الفيديو أو الملفات — استخدم أزرار إنهاء الجمع والتخطي والتأكيد الظاهرة في كل خطوة.\n"
             "/search كلمة — البحث بالاسم.\n"
             '/download — اختيار ملفات متعددة من المتصفح، ثم /download_done؛ أو /download "مسار" مباشرة.\n'
             "/cancel_download — إلغاء اختيار التنزيل الجاري.\n"
@@ -379,7 +419,10 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             return
         user_id = message.from_user.id
         if user_id in _UPLOAD_SESSIONS:
-            await message.answer("لديك جلسة رفع قائمة. استخدم /upload_done أو /cancel_upload.")
+            await message.answer(
+                "لديك جلسة رفع قائمة. أرسل الملفات أولًا، ثم استخدم الزر المناسب أدناه.",
+                reply_markup=_upload_keyboard("collecting"),
+            )
             return
         _UPLOAD_SESSIONS[user_id] = {
             "stage": "collecting",
@@ -391,7 +434,9 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
         }
         await message.answer(
             f"الوجهة الحالية: {settings.drive_root}\nيمكنك اختيار مجلد آخر من المتصفح أدناه، "
-            f"ثم أرسل حتى {settings.max_files_per_batch} ملفات وأرسل /upload_done."
+            f"ثم أرسل حتى {settings.max_files_per_batch} ملفات. بعد كل ملف سأعرض لك حالته."
+            " عند الانتهاء اضغط زر «انتهيت» أو أرسل /upload_done.",
+            reply_markup=_upload_keyboard("collecting"),
         )
         await render_browse(message, user_id, root_path())
 
@@ -401,7 +446,8 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
         await message.answer(
             f"ملخص الرفع إلى {session['destination']}:\n{rows}\n"
             f"الوصف: {session['description'] or '—'}\nالملاحظة: {session['note'] or '—'}\n"
-            "أكد عبر /upload_confirm أو ألغِ عبر /cancel_upload."
+            "راجع التفاصيل ثم اضغط «تأكيد ورفع إلى Drive». يمكنك إضافة ملفات أخرى أو إلغاء الجلسة.",
+            reply_markup=_upload_keyboard("confirm"),
         )
 
     @router.message(Command("upload_done"))
@@ -410,10 +456,16 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             return
         session = _UPLOAD_SESSIONS.get(message.from_user.id)
         if not session or session["stage"] != "collecting" or not session["files"]:
-            await message.answer("لا توجد ملفات مجمعة. ابدأ عبر /upload ثم أرسل الملفات.")
+            await message.answer(
+                "لا توجد ملفات مجمعة. ابدأ عبر /upload، ثم أرسل الفيديو أو الملف قبل إنهاء الجمع.",
+                reply_markup=_upload_keyboard("collecting"),
+            )
             return
         session["stage"] = "description"
-        await message.answer("أرسل وصفًا مشتركًا اختياريًا أو /skip للتخطي.")
+        await message.answer(
+            f"تم جمع {len(session['files'])} ملفًا. أرسل وصفًا مشتركًا اختياريًا أو اضغط «تخطي هذه الخطوة».",
+            reply_markup=_upload_keyboard("description"),
+        )
 
     @router.message(Command("skip"))
     async def skip_upload_field(message: Message) -> None:
@@ -424,7 +476,10 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             return
         if session["stage"] == "description":
             session["stage"] = "note"
-            await message.answer("أرسل ملاحظة مشتركة اختيارية أو /skip للتخطي.")
+            await message.answer(
+                "أرسل ملاحظة مشتركة اختيارية أو اضغط «تخطي هذه الخطوة».",
+                reply_markup=_upload_keyboard("note"),
+            )
         elif session["stage"] == "note":
             await show_upload_summary(message, session)
 
@@ -438,7 +493,9 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             return
         for item in session["files"]:
             Path(item["path"]).unlink(missing_ok=True)
-        await message.answer("أُلغيت الجلسة وحُذفت الملفات المؤقتة؛ لم تتغير ملفات Drive.")
+        await message.answer(
+            "أُلغيت الجلسة وحُذفت الملفات المؤقتة؛ لم تتغير ملفات Drive.", reply_markup=MENU
+        )
 
     @router.message(Command("upload_confirm"))
     async def upload_confirm(message: Message) -> None:
@@ -490,14 +547,78 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             if remaining:
                 session["files"] = remaining
                 await message.answer(
-                    "أُبقيت الملفات الفاشلة محليًا. صحح المشكلة ثم أعد /upload_confirm أو استخدم /cancel_upload."
+                    "أُبقيت الملفات الفاشلة محليًا. صحح المشكلة ثم اضغط «تأكيد ورفع» للمحاولة مجددًا أو ألغِ الجلسة.",
+                    reply_markup=_upload_keyboard("confirm"),
                 )
             else:
                 _UPLOAD_SESSIONS.pop(user_id, None)
                 for item in session["files"]:
                     Path(item["path"]).unlink(missing_ok=True)
+                await message.answer("اكتمل الرفع بنجاح. يمكنك بدء دفعة جديدة من القائمة.", reply_markup=MENU)
         except (OSError, ValueError) as exc:
-            await message.answer(f"تعذر بدء الرفع: {exc}. تبقى الملفات المؤقتة لمحاولة أخرى.")
+            await message.answer(
+                f"تعذر بدء الرفع: {exc}. تبقى الملفات المؤقتة لمحاولة أخرى.",
+                reply_markup=_upload_keyboard("confirm"),
+            )
+
+    @router.callback_query(F.data.startswith("up:"))
+    async def upload_callback(query: CallbackQuery) -> None:
+        if not isinstance(query.message, Message):
+            await query.answer("تعذر الوصول إلى رسالة جلسة الرفع.", show_alert=True)
+            return
+        user_id = query.from_user.id
+        action = (query.data or "").partition(":")[2]
+        session = _UPLOAD_SESSIONS.get(user_id)
+        try:
+            if action == "menu":
+                await query.message.answer("القائمة الرئيسية:", reply_markup=MENU)
+            elif action == "folder":
+                if not session or session["stage"] != "collecting":
+                    raise ValueError("لا توجد جلسة جمع ملفات نشطة")
+                await render_browse(query.message, user_id, Path(session["destination"]), edit=False)
+            elif action == "done":
+                if not session or session["stage"] != "collecting" or not session["files"]:
+                    raise ValueError("أرسل ملفًا واحدًا على الأقل قبل إنهاء الجمع")
+                session["stage"] = "description"
+                await query.message.answer(
+                    f"تم جمع {len(session['files'])} ملفًا. أرسل وصفًا مشتركًا اختياريًا أو اضغط «تخطي هذه الخطوة».",
+                    reply_markup=_upload_keyboard("description"),
+                )
+            elif action == "skip":
+                if not session or session["stage"] not in {"description", "note"}:
+                    raise ValueError("لا توجد خطوة وصف أو ملاحظة نشطة")
+                if session["stage"] == "description":
+                    session["stage"] = "note"
+                    await query.message.answer(
+                        "أرسل ملاحظة مشتركة اختيارية أو اضغط «تخطي هذه الخطوة».",
+                        reply_markup=_upload_keyboard("note"),
+                    )
+                else:
+                    await show_upload_summary(query.message, session)
+            elif action == "more":
+                if not session or session["stage"] != "confirm":
+                    raise ValueError("لا توجد دفعة جاهزة للإضافة")
+                session["stage"] = "collecting"
+                await query.message.answer(
+                    "يمكنك الآن إرسال ملفات أخرى. عند الانتهاء اضغط الزر أو أرسل /upload_done.",
+                    reply_markup=_upload_keyboard("collecting"),
+                )
+            elif action == "confirm":
+                if not session or session["stage"] != "confirm":
+                    raise ValueError("لا توجد دفعة جاهزة للتأكيد")
+                await upload_confirm(query.message)
+            elif action == "cancel":
+                if not session:
+                    raise ValueError("لا توجد جلسة رفع لإلغائها")
+                _UPLOAD_SESSIONS.pop(user_id, None)
+                for item in session["files"]:
+                    Path(item["path"]).unlink(missing_ok=True)
+                await query.message.answer("أُلغيت الجلسة ولم تتغير ملفات Drive.", reply_markup=MENU)
+            else:
+                raise ValueError("زر غير معروف")
+            await query.answer("تم")
+        except (OSError, ValueError) as exc:
+            await query.answer(str(exc)[:180], show_alert=True)
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def upload_metadata(message: Message) -> None:
@@ -512,7 +633,10 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
         elif session["stage"] == "description":
             session["description"] = text
             session["stage"] = "note"
-            await message.answer("أرسل ملاحظة مشتركة أو /skip للتخطي.")
+            await message.answer(
+                "تم حفظ الوصف. أرسل ملاحظة مشتركة اختيارية أو اضغط «تخطي هذه الخطوة».",
+                reply_markup=_upload_keyboard("note"),
+            )
         else:
             session["note"] = text
             await show_upload_summary(message, session)
@@ -982,67 +1106,78 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             "أُرسل طلب الإلغاء." if jobs.cancel(job_id, message.from_user.id) else "لم أجد عملية جارية بهذا المعرف تخصك."
         )
 
-    @router.message(F.document)
-    async def receive_document(message: Message, bot: Bot) -> None:
+    @router.message(F.document | F.video | F.audio | F.photo)
+    async def receive_media(message: Message, bot: Bot) -> None:
         if not authorized(message, settings):
             await message.answer("غير مصرح لك باستخدام البوت.")
             return
-        document = message.document
-        if document is None:
+        media: Document | Video | Audio | PhotoSize | None = (
+            message.document
+            or message.video
+            or message.audio
+            or (message.photo[-1] if message.photo else None)
+        )
+        if media is None:
             return
+        file_id, file_unique_id, expected_size, name = _media_details(media)
         user_id = message.from_user.id
         session = _UPLOAD_SESSIONS.get(user_id)
         if session and session["stage"] != "collecting":
-            await message.answer("اكتمل اختيار الملفات. استخدم /upload_confirm أو /cancel_upload أولًا.")
+            await message.answer(
+                "اكتملت مرحلة جمع الملفات. استخدم الأزرار الظاهرة لتأكيد الرفع أو أضف الملفات بعد اختيار «إضافة ملفات أخرى».",
+                reply_markup=_upload_keyboard(session["stage"]),
+            )
             return
         if session and len(session["files"]) >= settings.max_files_per_batch:
-            await message.answer(f"وصلت إلى الحد المضبوط وهو {settings.max_files_per_batch} ملفًا لهذه الدفعة.")
+            await message.answer(
+                f"وصلت إلى الحد المضبوط وهو {settings.max_files_per_batch} ملفًا لهذه الدفعة. اضغط «انتهيت» للمتابعة.",
+                reply_markup=_upload_keyboard("collecting"),
+            )
             return
-        if document.file_size and document.file_size > settings.max_operation_gb * 1024**3:
+        if expected_size and expected_size > settings.max_operation_gb * 1024**3:
             await message.answer("حجم الملف يتجاوز حد العملية المضبوط.")
             return
         settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(settings.temp_dir).free < (document.file_size or 0) * 1.1:
+        if shutil.disk_usage(settings.temp_dir).free < (expected_size or 0) * 1.1:
             await message.answer("المساحة المحلية غير كافية لاستقبال الملف بأمان.")
             return
         local_temp: Path | None = None
         target: Path | None = None
         try:
-            remote = await bot.get_file(document.file_id)
+            remote = await bot.get_file(file_id)
             local = Path(remote.file_path)
             if session:
-                local_temp = (
-                    settings.temp_dir / f"dtm-batch-{uuid4().hex}-{safe_name(document.file_name or 'upload.bin')}"
-                )
+                local_temp = settings.temp_dir / f"dtm-batch-{uuid4().hex}-{name}"
                 if local.is_absolute():
                     size = await asyncio.to_thread(fs.copy_streaming, local, local_temp)
                 else:
                     await bot.download_file(remote.file_path, destination=local_temp)
                     size = local_temp.stat().st_size
-                if document.file_size is not None and size != document.file_size:
+                if expected_size is not None and size != expected_size:
                     raise OSError("حجم الملف المستلم لا يطابق القيمة المتوقعة")
                 session["files"].append(
                     {
                         "path": str(local_temp),
-                        "name": safe_name(document.file_name or local_temp.name),
+                        "name": name,
                         "size": size,
                     }
                 )
                 local_temp = None  # ownership transferred to the per-user session
                 await message.answer(
-                    f"أُضيف الملف إلى دفعتك ({len(session['files'])}/{settings.max_files_per_batch}). أرسل المزيد أو /upload_done."
+                    f"✅ أُضيف {name} إلى دفعتك ({len(session['files'])}/{settings.max_files_per_batch}).\n"
+                    "أرسل المزيد، أو اضغط «انتهيت من إرسال الملفات» للانتقال للخطوة التالية.",
+                    reply_markup=_upload_keyboard("collecting"),
                 )
                 return
             if not local.is_absolute():
-                local_temp = settings.temp_dir / f"dtm-in-{uuid4().hex}-{safe_name(document.file_name or 'upload.bin')}"
+                local_temp = settings.temp_dir / f"dtm-in-{uuid4().hex}-{name}"
                 await bot.download_file(remote.file_path, destination=local_temp)
                 local = local_temp
-            name = safe_name(document.file_name or local.name)
             target = unique_destination(root_path() / name)
             size = await asyncio.to_thread(fs.copy_streaming, local, target)
-            if document.file_size is not None and size != document.file_size:
+            if expected_size is not None and size != expected_size:
                 target.unlink(missing_ok=True)
-                raise OSError(f"عدم تطابق الحجم المتوقع ({document.file_size}) مع المحفوظ ({size})")
+                raise OSError(f"عدم تطابق الحجم المتوقع ({expected_size}) مع المحفوظ ({size})")
             caption = message.caption or ""
             description, note = caption, ""
             for line in caption.splitlines():
@@ -1054,7 +1189,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 await asyncio.to_thread(
                     CsvIndex(target.parent / settings.index_filename).append,
                     target,
-                    group_id=document.media_group_id or document.file_unique_id,
+                    group_id=getattr(media, "media_group_id", None) or file_unique_id,
                     description=description,
                     note=note,
                 )
@@ -1063,7 +1198,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 return
             await message.answer(f"تم حفظ {target.name} في Drive ({size:,} بايت) وتحديث CSV.")
         except Exception as exc:
-            log.exception("Document transfer failed")
+            log.exception("Media transfer failed")
             await message.answer(
                 f"فشل استقبال أو حفظ الملف: {type(exc).__name__}. تحقق من الخادم المحلي ومساحة Drive ثم أعد المحاولة."
             )

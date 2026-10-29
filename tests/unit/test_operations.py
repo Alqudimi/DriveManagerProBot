@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.types import Video
 from aiohttp import web
 
 from drive_telegram_manager.config import Settings
@@ -17,8 +18,10 @@ from drive_telegram_manager.telegram.bot import (
     ProgressInputFile,
     _create_directory_zip,
     _find_index_rows,
+    _media_details,
     _resolve_user_path,
     _split_pair,
+    _upload_keyboard,
     build_bot,
     make_dispatcher,
 )
@@ -27,6 +30,27 @@ from drive_telegram_manager.telegram.bot import (
 def test_mv_parser_supports_quoted_paths():
     assert _split_pair('/mv "folder/a file.txt" "new name.txt"', "mv") == ("folder/a file.txt", "new name.txt")
     assert _split_pair('/move "a.txt" => "folder with spaces"', "move") == ("a.txt", "folder with spaces")
+
+
+def test_video_is_treated_as_an_uploadable_media_file():
+    file_id, unique_id, size, name = _media_details(
+        Video(
+            file_id="video-id",
+            file_unique_id="video-unique-id",
+            width=1920,
+            height=1080,
+            duration=12,
+            file_name="رحلة.mp4",
+            file_size=2048,
+        )
+    )
+    assert (file_id, unique_id, size, name) == ("video-id", "video-unique-id", 2048, "رحلة.mp4")
+
+
+def test_upload_keyboard_exposes_next_action_for_each_stage():
+    assert _upload_keyboard("collecting").inline_keyboard[0][0].callback_data == "up:done"
+    assert _upload_keyboard("description").inline_keyboard[0][0].callback_data == "up:skip"
+    assert _upload_keyboard("confirm").inline_keyboard[0][0].callback_data == "up:confirm"
 
 
 def test_relative_drive_paths_stay_inside_allowed_root(tmp_path: Path):
