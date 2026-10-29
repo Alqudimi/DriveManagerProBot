@@ -23,6 +23,7 @@ from drive_telegram_manager.telegram.bot import (
     _progress_bar,
     _resolve_user_path,
     _split_pair,
+    _transfer_cancel_keyboard,
     _upload_keyboard,
     build_bot,
     make_dispatcher,
@@ -58,6 +59,11 @@ def test_upload_keyboard_exposes_next_action_for_each_stage():
 def test_upload_progress_format_is_readable():
     assert _format_bytes(1024 * 1024) == "1.0 MB"
     assert _progress_bar(50, 100) == "█████░░░░░ 50%"
+
+
+def test_transfer_progress_keyboard_has_cancel_callback():
+    markup = _transfer_cancel_keyboard("dlcancel:1234", "التنزيل")
+    assert markup.inline_keyboard[0][0].callback_data == "dlcancel:1234"
 
 
 def test_relative_drive_paths_stay_inside_allowed_root(tmp_path: Path):

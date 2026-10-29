@@ -51,6 +51,11 @@ _PENDING_DELETE: dict[str, tuple[int, Path]] = {}
 _UPLOAD_SESSIONS: dict[int, dict] = {}
 _DOWNLOAD_SESSIONS: dict[int, dict] = {}
 _BROWSE_TOKENS: dict[str, tuple[int, str, Path, int]] = {}
+_UPLOAD_CANCEL_REQUESTS: set[int] = set()
+
+
+class TransferCancelled(Exception):
+    """Raised when the owner explicitly cancels an active media transfer."""
 
 
 def _upload_keyboard(stage: str) -> InlineKeyboardMarkup:
@@ -102,6 +107,12 @@ def _progress_bar(completed: int, total: int) -> str:
     ratio = min(1.0, completed / total) if total else 1.0
     filled = int(ratio * 10)
     return f"{'█' * filled}{'░' * (10 - filled)} {ratio:.0%}"
+
+
+def _transfer_cancel_keyboard(callback_data: str, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=f"⏹ إلغاء {label}", callback_data=callback_data)]]
+    )
 
 
 class ProgressInputFile(FSInputFile):
@@ -585,6 +596,11 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
         action = (query.data or "").partition(":")[2]
         session = _UPLOAD_SESSIONS.get(user_id)
         try:
+            if action == "stop":
+                _UPLOAD_CANCEL_REQUESTS.add(user_id)
+                await query.message.edit_text("⏳ جارٍ إلغاء الرفع... سيتم تنظيف الملف المؤقت.")
+                await query.answer("تم طلب إلغاء الرفع")
+                return
             if action == "menu":
                 await query.message.answer("القائمة الرئيسية:", reply_markup=MENU)
             elif action == "folder":
@@ -634,6 +650,18 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             await query.answer("تم")
         except (OSError, ValueError) as exc:
             await query.answer(str(exc)[:180], show_alert=True)
+
+    @router.callback_query(F.data.startswith("dlcancel:"))
+    async def cancel_download_progress(query: CallbackQuery) -> None:
+        if not isinstance(query.message, Message):
+            await query.answer("تعذر الوصول إلى رسالة التقدم.", show_alert=True)
+            return
+        job_id = (query.data or "").partition(":")[2]
+        if not jobs.cancel(job_id, query.from_user.id):
+            await query.answer("انتهت العملية أو لا تخصك.", show_alert=True)
+            return
+        await query.message.edit_text("⏳ جارٍ إلغاء التنزيل... لن يتأثر ملف Drive الأصلي.")
+        await query.answer("تم طلب الإلغاء")
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def upload_metadata(message: Message) -> None:
@@ -875,7 +903,10 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 raise FileNotFoundError("المسار ليس ملفًا أو مجلدًا قابلًا للإرسال")
 
             size = send_path.stat().st_size
-            progress_message = await message.answer(f"📥 بدء إرسال {display_name} ({size:,} بايت).")
+            progress_message = await message.answer(
+                f"📥 بدء إرسال {display_name} ({size:,} بايت).",
+                reply_markup=_transfer_cancel_keyboard(f"dlcancel:{job.job_id}", "التنزيل"),
+            )
             started = time.monotonic()
             last_update = [started]
 
@@ -905,7 +936,9 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                     "الحالة: إرسال إلى Telegram (التقدم يقيس تدفق الملف من القرص إلى طلب API)."
                 )
                 try:
-                    await progress_message.edit_text(text)
+                    await progress_message.edit_text(
+                        text, reply_markup=_transfer_cancel_keyboard(f"dlcancel:{job.job_id}", "التنزيل")
+                    )
                 except Exception:
                     log.debug("Unable to update Telegram transfer progress message")
 
@@ -955,7 +988,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                     f"أُرسل الملف مقسمًا إلى {manifest['part_count']} أجزاء. أُبقيت الأجزاء في: {parts_dir}"
                 )
             try:
-                await progress_message.edit_text(f"✅ اكتمل إرسال {display_name} إلى محادثة Telegram.")
+                await progress_message.edit_text(f"✅ اكتمل إرسال {display_name} إلى محادثة Telegram.", reply_markup=None)
             except Exception:
                 log.debug("Unable to finalize Telegram transfer progress message")
             job.status = "completed"
@@ -1162,7 +1195,8 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
         try:
             progress_message = await message.answer(
                 f"⏳ بدء استقبال {name}\n{_progress_bar(0, expected_size or 0)}\n"
-                f"0 B / {_format_bytes(expected_size or 0)}"
+                f"0 B / {_format_bytes(expected_size or 0)}",
+                reply_markup=_transfer_cancel_keyboard("up:stop", "الرفع"),
             )
             started = time.monotonic()
             last_update = [started]
@@ -1170,6 +1204,8 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
 
             async def update_upload_progress(completed: int, *, force: bool = False) -> None:
                 if progress_message is None:
+                    return
+                if user_id in _UPLOAD_CANCEL_REQUESTS:
                     return
                 current = time.monotonic()
                 if not force and current - last_update[0] < settings.progress_update_interval:
@@ -1184,12 +1220,15 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                         f"📤 رفع {name}\n{_progress_bar(completed, total)}\n"
                         f"{_format_bytes(completed)} / {_format_bytes(total)}\n"
                         f"السرعة: {_format_bytes(int(speed))}/ث — المتبقي التقريبي: {int(remaining)}ث\n"
-                        "الحالة: استقبال الملف وتجهيزه للحفظ في Drive"
+                        "الحالة: استقبال الملف وتجهيزه للحفظ في Drive",
+                        reply_markup=_transfer_cancel_keyboard("up:stop", "الرفع"),
                     )
                 except Exception:
                     log.debug("Unable to update upload progress", exc_info=True)
 
             def schedule_upload_progress(completed: int) -> None:
+                if user_id in _UPLOAD_CANCEL_REQUESTS:
+                    raise TransferCancelled
                 loop.call_soon_threadsafe(asyncio.create_task, update_upload_progress(completed))
 
             remote = await bot.get_file(file_id)
@@ -1203,6 +1242,8 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 else:
                     await bot.download_file(remote.file_path, destination=local_temp)
                     size = local_temp.stat().st_size
+                if user_id in _UPLOAD_CANCEL_REQUESTS:
+                    raise TransferCancelled
                 if expected_size is not None and size != expected_size:
                     raise OSError("حجم الملف المستلم لا يطابق القيمة المتوقعة")
                 await update_upload_progress(size, force=True)
@@ -1226,6 +1267,8 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 local_temp = settings.temp_dir / f"dtm-in-{uuid4().hex}-{name}"
                 await bot.download_file(remote.file_path, destination=local_temp)
                 local = local_temp
+            if user_id in _UPLOAD_CANCEL_REQUESTS:
+                raise TransferCancelled
             target = unique_destination(root_path() / name)
             size = await asyncio.to_thread(fs.copy_streaming, local, target, on_progress=schedule_upload_progress)
             if expected_size is not None and size != expected_size:
@@ -1253,6 +1296,18 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
             if progress_message is not None:
                 await progress_message.edit_text(f"✅ اكتمل حفظ {target.name} في Drive ({size:,} بايت).")
             await message.answer(f"تم حفظ {target.name} في Drive ({size:,} بايت) وتحديث CSV.")
+        except TransferCancelled:
+            if target is not None:
+                target.unlink(missing_ok=True)
+            if progress_message is not None:
+                try:
+                    await progress_message.edit_text(f"⏹ أُلغي رفع {name} ولم يتغير ملف Drive الأصلي.")
+                except Exception:
+                    log.debug("Unable to finalize cancelled upload progress", exc_info=True)
+            await message.answer(
+                "تم إلغاء الرفع الحالي. الملفات التي أُضيفت سابقًا إلى الجلسة ما زالت محفوظة ويمكنك المتابعة أو الإلغاء.",
+                reply_markup=_upload_keyboard("collecting") if session else MENU,
+            )
         except Exception as exc:
             log.exception("Media transfer failed")
             if progress_message is not None:
@@ -1264,6 +1319,7 @@ def make_dispatcher(settings: Settings) -> Dispatcher:
                 f"فشل استقبال أو حفظ الملف: {type(exc).__name__}. تحقق من الخادم المحلي ومساحة Drive ثم أعد المحاولة."
             )
         finally:
+            _UPLOAD_CANCEL_REQUESTS.discard(user_id)
             if local_temp:
                 local_temp.unlink(missing_ok=True)
 
